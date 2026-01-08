@@ -974,6 +974,15 @@ public sealed class RarityBackgroundSpriteGeneratorWindow : EditorWindow
             return;
         }
 
+        // We will generate ALL PNG files first, then configure/import them as Sprites afterwards.
+        // Why? Because calling SaveAndReimport while AssetDatabase.StartAssetEditing() is active
+        // can result in Unity deferring/skipping importer settings in a way that leaves assets
+        // as plain textures ("images") rather than properly-imported Sprites.
+        // Store Unity asset paths ("Assets/...") instead of absolute OS paths.
+        // This makes the later import step more robust and avoids any path separator/casing issues.
+        List<(string unityAssetPath, Settings settings)> generated = new List<(string, Settings)>();
+
+
         // Reduce import overhead by batching asset edits.
         AssetDatabase.StartAssetEditing();
         try
@@ -1005,14 +1014,46 @@ public sealed class RarityBackgroundSpriteGeneratorWindow : EditorWindow
                 WriteTextureToPng(tex, filePath);
                 DestroyImmediate(tex);
 
-                ImportAsSprite(filePath, s);
+                // Don't import/configure as Sprite yet. Just record what we generated.
+                // We'll do the actual importer configuration AFTER we exit StartAssetEditing/StopAssetEditing.
+                // Convert the absolute disk path to a Unity project-relative asset path ("Assets/..."),
+                // and store that instead of the OS file path.
+                string unityPath = ToUnityAssetPath(filePath);
+                generated.Add((unityPath, s));
+
             }
         }
         finally
         {
             AssetDatabase.StopAssetEditing();
+
+            // Important: Refresh once after writing files so Unity creates/imports the new assets.
+            AssetDatabase.Refresh(ImportAssetOptions.ForceSynchronousImport);
+        }
+
+
+        // Now that we're OUTSIDE the AssetEditing batch, we can safely:
+        // 1) ensure Unity sees the new files (Refresh already done in finally)
+        // 2) configure each asset's TextureImporter as a Sprite
+        //
+        // Doing it here ensures the importer settings actually "stick" for batch output.
+        AssetDatabase.StartAssetEditing();
+        try
+        {
+            for (int i = 0; i < generated.Count; i++)
+            {
+                // Phase 2: configure each newly-written PNG asset as a Sprite using its Unity asset path.
+                ImportAsSpriteUnityPath(generated[i].unityAssetPath, generated[i].settings);
+            }
+        }
+        finally
+        {
+            AssetDatabase.StopAssetEditing();
+
+            // Optional: Refresh again (safe). You can omit if ImportAsSprite does SaveAndReimport reliably.
             AssetDatabase.Refresh();
         }
+
     }
 
     // ----------------------------
@@ -1660,6 +1701,42 @@ if (outline > 0f)
 
         importer.SaveAndReimport();
     }
+
+    /// <summary>
+    /// Imports and configures a sprite given a Unity asset path (e.g. "Assets/Icons/MySprite.png").
+    /// This avoids any reliance on absolute disk paths and is often the most reliable way to drive imports in batch.
+    /// </summary>
+    private static void ImportAsSpriteUnityPath(string unityAssetPath, Settings s)
+    {
+        if (string.IsNullOrEmpty(unityAssetPath)) return;
+
+        // Ensure Unity imports/updates the asset record.
+        AssetDatabase.ImportAsset(unityAssetPath, ImportAssetOptions.ForceUpdate);
+
+        // Fetch the importer for this path.
+        TextureImporter importer = AssetImporter.GetAtPath(unityAssetPath) as TextureImporter;
+        if (importer == null) return;
+
+        // Configure as Sprite (2D/UI).
+        importer.textureType = TextureImporterType.Sprite;
+        importer.spriteImportMode = SpriteImportMode.Single;
+        importer.alphaIsTransparency = true;
+
+        // UI typically wants no mipmaps.
+        importer.mipmapEnabled = !s.DisableMipMaps;
+
+        importer.sRGBTexture = true;
+        importer.filterMode = FilterMode.Bilinear;
+
+        if (s.ClampWrapMode)
+            importer.wrapMode = TextureWrapMode.Clamp;
+
+        importer.spritePixelsPerUnit = Mathf.Max(1f, s.PixelsPerUnit);
+
+        // Apply importer changes.
+        importer.SaveAndReimport();
+    }
+
 
     private static string ToUnityAssetPath(string absoluteFilePath)
     {
